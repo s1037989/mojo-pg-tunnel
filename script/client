@@ -1,0 +1,37 @@
+#!/usr/bin/env perl
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Mojolicious::Lite -signatures;
+use PgTunnel::Client;
+
+helper tunnel => sub {
+  state $client = PgTunnel::Client->new(
+    url => $ENV{PG_TUNNEL_URL} // 'http://127.0.0.1:3001',
+    token => $ENV{PG_TUNNEL_TOKEN} // '',
+    allow_insecure => $ENV{PG_TUNNEL_ALLOW_INSECURE} // 0);
+};
+get '/' => {text => "Mojolicious PostgreSQL tunnel client\nGET /time\nGET /echo?value=hello\nGET /transaction-demo\n"};
+get '/time' => sub ($c) {
+  $c->render_later;
+  $c->tunnel->query_p('SELECT now()::text AS server_time, current_database() AS database')
+    ->then(sub ($r) { $c->render(json => $r->hash) })
+    ->catch(sub ($err) { $c->app->log->warn("$err"); $c->render(status => 502, json => {error => "$err"}) });
+};
+get '/echo' => sub ($c) {
+  $c->render_later;
+  $c->tunnel->query_p('SELECT ?::text AS echo', $c->param('value') // '')
+    ->then(sub ($r) { $c->render(json => $r->hash) })
+    ->catch(sub ($err) { $c->render(status => 502, json => {error => "$err"}) });
+};
+get '/transaction-demo' => sub ($c) {
+  $c->render_later;
+  # Temporary table demonstrates connection affinity without permanent data.
+  $c->tunnel->transaction_p(sub ($tx) {
+    return $tx->query_p('CREATE TEMP TABLE tunnel_demo (value text) ON COMMIT DROP')
+      ->then(sub { $tx->query_p('INSERT INTO tunnel_demo VALUES (?)', 'same connection') })
+      ->then(sub { $tx->query_p('SELECT value, pg_backend_pid() AS backend_pid FROM tunnel_demo') })
+      ->then(sub ($r) { $r->hash });
+  })->then(sub ($row) { $c->render(json => $row) })
+    ->catch(sub ($err) { $c->render(status => 502, json => {error => "$err"}) });
+};
+app->start;
